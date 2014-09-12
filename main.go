@@ -5,13 +5,13 @@ import (
 	"flag"
 	"fmt"
 	"github.com/codegangsta/negroni"
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/go-sql-driver/mysql"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"runtime"
-	"strings"
 	"time"
 )
 
@@ -45,7 +45,7 @@ type (
 	Request struct {
 		ResponseWriter http.ResponseWriter
 		HTTPRequest    *http.Request
-		Result         chan bool
+		// Result         chan bool
 	}
 )
 
@@ -59,8 +59,8 @@ func (h *ProxyHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	h.serveMux.ServeHTTP(rw, req)
 }
 
-func NewDBConn(uri string) (*DB, error) {
-	db, err := sql.Open("sqlite3", uri)
+func NewDBConn(dsn string) (*DB, error) {
+	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -69,12 +69,12 @@ func NewDBConn(uri string) (*DB, error) {
 
 func (db *DB) CreateLayout() error {
 	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS records (
-id INTEGER PRIMARY KEY AUTOINCREMENT,
-email VARCHAR,
-ip VARCHAR,
-count INTEGER DEFAULT '0',
-date INTEGER
-)`)
+id SERIAL,
+email VARCHAR(100),
+ip VARCHAR(45),
+count INTEGER UNSIGNED DEFAULT 0,
+date INTEGER UNSIGNED
+) ENGINE = InnoDB`)
 	if err != nil{
 		return err
 	}
@@ -93,7 +93,7 @@ func (tx *Tx) GetRecord(email, ip string, ts int64) (*Record, error) {
 	stmt, err := tx.Prepare(`SELECT * FROM records
 WHERE records.email=?
 AND records.ip=?
-AND DATE(?, 'unixepoch')=DATE('now')
+AND DATE(FROM_UNIXTIME(?))=DATE(NOW())
 LIMIT 1`)
 	if err != nil {
 		return nil, err
@@ -126,7 +126,7 @@ func (tx *Tx) IncRecord(email, ip string, ts int64) error {
 	stmt, err := tx.Prepare(`UPDATE records SET count=count+1
 WHERE records.email=?
 AND records.ip=?
-AND DATE(?, 'unixepoch')=DATE('now')`)
+AND DATE(FROM_UNIXTIME(?))=DATE(NOW())`)
 	if err != nil {
 		return err
 	}
@@ -138,8 +138,8 @@ AND DATE(?, 'unixepoch')=DATE('now')`)
 	return nil
 }
 
-func NewRateLimitMiddleWare() *RateLimiter {
-	requests := RateLimitWorkerPool()
+func NewRateLimitMiddleWare(dsn string) *RateLimiter {
+	requests := RateLimitWorkerPool(dsn)
 	return &RateLimiter{requests}
 }
 
@@ -147,21 +147,22 @@ func (m *RateLimiter) ServeHTTP(rw http.ResponseWriter, req *http.Request, next 
 	request := &Request{
 		ResponseWriter: rw,
 		HTTPRequest:    req,
-		Result:         make(chan bool),
+		// Result:         make(chan bool),
 	}
 	m.Requests <- request
-	ok := <-request.Result
-	if ok {
-	}
+	// TODO Later when block is needed
+	// ok := <-request.Result
+	// if ok {
+	// }
 
 	next(rw, req)
 }
 
-func RateLimitWorkerPool() chan *Request {
-	requests := make(chan *Request)
+func RateLimitWorkerPool(dsn string) chan *Request {
 	cpuCount := runtime.NumCPU()
+	requests := make(chan *Request)
 	for i := 0; i < cpuCount; i++ {
-		db, err := NewDBConn("record.db")
+		db, err := NewDBConn(dsn)
 		if err != nil {
 			log.Fatal(err.Error())
 		}
@@ -181,8 +182,15 @@ func RateLimitWorkerPool() chan *Request {
 
 func RateLimitWorker(requests chan *Request, db *DB) {
 	for request := range requests {
-		ip := request.HTTPRequest.RemoteAddr
-		ip = strings.Split(ip, ":")[0]
+		// remote := request.HTTPRequest.RemoteAddr
+		// remote = strings.Split(remote, ":")[0]
+		// forwarded := request.HTTPRequest.Header.Get("X-Forwarded-For")
+		// real := request.HTTPRequest.Header.Get("X-Real-IP")
+		// log.Printf("remote (%s), forwarded (%s), real (%s)", remote, forwarded, real)
+		// ip := forwarded
+
+		ip := request.HTTPRequest.Header.Get("X-Forwarded-For")
+
 		email := request.HTTPRequest.Header.Get("X-Forwarded-Email")
 		ts := time.Now().Unix()
 
@@ -191,35 +199,38 @@ func RateLimitWorker(requests chan *Request, db *DB) {
 			log.Print(err.Error())
 		}
 
-		var count int
-		record, err := tx.GetRecord(email, ip, ts)
+		// TODO Implement when blocking is needed
+		// var count int
+		// record, err := tx.GetRecord(email, ip, ts)
+		_, err = tx.GetRecord(email, ip, ts)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				if err := tx.NewRecord(email, ip, ts); err != nil {
 					log.Print(err.Error())
 					// Pass through if error
 					tx.Rollback()
-					request.Result <- true
+					// request.Result <- true
 					continue
 				}
-				count = 0
+				// count = 0
 			} else {
 				log.Print(err.Error())
 				// Pass through if error
 				tx.Rollback()
-				request.Result <- true
+				// request.Result <- true
 				continue
 			}
 		} else {
-			count = record.Count
+			// count = record.Count
 		}
 
-		log.Printf("ip: %s, email: %s, count: %d", ip, email, count)
+		// Debugging
+		// log.Printf("ip: %s, email: %s, count: %d", ip, email, count)
 
 		if err := tx.IncRecord(email, ip, ts); err != nil {
 			log.Print(err.Error())
 			tx.Rollback()
-			request.Result <- true
+			// request.Result <- true
 			continue
 		}
 
@@ -229,7 +240,7 @@ func RateLimitWorker(requests chan *Request, db *DB) {
 		}
 
 		// TODO return false if limit exceeded
-		request.Result <- true
+		// request.Result <- true
 	}
 }
 
@@ -238,23 +249,36 @@ func main() {
 
 	httpAddr := flag.String("http-address", "127.0.0.1:4765", "<addr>:<port> to listen on")
 	upstream := flag.String("upstream", "", "http url for the upstream endpoint")
+	dsn := flag.String("db", "", "Database source name")
 	flag.Parse()
 
 	if *upstream == "" {
-		log.Fatal("--upstream not found")
 		flag.Usage()
+		log.Fatal("--upstream not found")
+	}
+
+	dataSource := *dsn
+	if dataSource == "" {
+		if os.Getenv("HYPERION_DB") != "" {
+			dataSource = os.Getenv("HYPERION_DB")
+		}
+	}
+
+	if dataSource == "" {
+		flag.Usage()
+		log.Fatal("--db or HYPERION_DB not found")
 	}
 
 	upstreamURL, err := url.Parse(*upstream)
 	if err != nil {
-		log.Fatalf("invalid --upstream (%s) %s", upstream, err.Error())
 		flag.Usage()
+		log.Fatalf("invalid --upstream (%s) %s", upstream, err.Error())
 	}
 
 	recovery := negroni.NewRecovery()
 	logger := negroni.NewLogger()
 	proxyHandler := NewProxyHandler(upstreamURL)
-	rateLimiter := NewRateLimitMiddleWare()
+	rateLimiter := NewRateLimitMiddleWare(dataSource)
 
 	n := negroni.New(recovery, logger)
 	n.Use(rateLimiter)
