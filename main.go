@@ -11,7 +11,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
-	"runtime"
+	"strings"
 	"time"
 )
 
@@ -39,7 +39,7 @@ type (
 		Email string
 		IP    string
 		Count int
-		Date  int64
+		Date  string
 	}
 
 	Request struct {
@@ -67,17 +67,34 @@ func NewDBConn(dsn string) (*DB, error) {
 	return &DB{db}, nil
 }
 
-func (db *DB) CreateLayout() error {
-	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS records (
-id SERIAL,
-email VARCHAR(100),
-ip VARCHAR(45),
-count INTEGER UNSIGNED DEFAULT 0,
-date INTEGER UNSIGNED
-) ENGINE = InnoDB`)
-	if err != nil{
+func LayoutDB(dsn string) error {
+	db, err := NewDBConn(dsn)
+	if err != nil {
 		return err
 	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		return err
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+
+	if err := tx.CreateLayout(); err != nil {
+		log.Print("double")
+		tx.Rollback()
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		log.Print("triple")
+		tx.Rollback()
+		return err
+	}
+
 	return nil
 }
 
@@ -89,11 +106,26 @@ func (db *DB) Begin() (*Tx, error) {
 	return &Tx{tx}, nil
 }
 
-func (tx *Tx) GetRecord(email, ip string, ts int64) (*Record, error) {
+func (tx *Tx) CreateLayout() error {
+	_, err := tx.Exec(`CREATE TABLE IF NOT EXISTS records (
+id SERIAL,
+email VARCHAR(100),
+ip VARCHAR(45),
+count INTEGER UNSIGNED DEFAULT 0,
+date DATE
+) ENGINE = InnoDB`)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (tx *Tx) GetRecord(email, ip, date string) (*Record, error) {
 	stmt, err := tx.Prepare(`SELECT * FROM records
 WHERE records.email=?
 AND records.ip=?
-AND DATE(FROM_UNIXTIME(?))=DATE(NOW())
+AND records.date=?
 LIMIT 1`)
 	if err != nil {
 		return nil, err
@@ -101,14 +133,14 @@ LIMIT 1`)
 	defer stmt.Close()
 
 	record := &Record{}
-	if err := stmt.QueryRow(email, ip, ts).Scan(&record.ID, &record.Email, &record.IP, &record.Count, &record.Date); err != nil {
+	if err := stmt.QueryRow(email, ip, date).Scan(&record.ID, &record.Email, &record.IP, &record.Count, &record.Date); err != nil {
 		return nil, err
 	}
 	// please check for sql.ErrNoRows
 	return record, nil
 }
 
-func (tx *Tx) NewRecord(email, ip string, ts int64) error {
+func (tx *Tx) NewRecord(email, ip, date string) error {
 	stmt, err := tx.Prepare(`INSERT INTO records (email, ip, date)
 VALUES (?, ?, ?)`)
 	if err != nil {
@@ -116,23 +148,23 @@ VALUES (?, ?, ?)`)
 	}
 	defer stmt.Close()
 
-	if _, err := stmt.Exec(email, ip, ts); err != nil {
+	if _, err := stmt.Exec(email, ip, date); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (tx *Tx) IncRecord(email, ip string, ts int64) error {
+func (tx *Tx) IncRecord(email, ip, date string) error {
 	stmt, err := tx.Prepare(`UPDATE records SET count=count+1
 WHERE records.email=?
 AND records.ip=?
-AND DATE(FROM_UNIXTIME(?))=DATE(NOW())`)
+AND records.date=?`)
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 
-	if _, err := stmt.Exec(email, ip, ts); err != nil {
+	if _, err := stmt.Exec(email, ip, date); err != nil {
 		return err
 	}
 	return nil
@@ -159,40 +191,27 @@ func (m *RateLimiter) ServeHTTP(rw http.ResponseWriter, req *http.Request, next 
 }
 
 func RateLimitWorkerPool(dsn string) chan *Request {
-	cpuCount := runtime.NumCPU()
 	requests := make(chan *Request)
-	for i := 0; i < cpuCount; i++ {
-		db, err := NewDBConn(dsn)
-		if err != nil {
-			log.Fatal(err.Error())
-		}
 
-		if err := db.Ping(); err != nil {
-			log.Fatal(err.Error())
-		}
-
-		if err := db.CreateLayout(); err != nil {
-			log.Fatal(err.Error())
-		}
-
-		go RateLimitWorker(requests, db)
+	db, err := NewDBConn(dsn)
+	if err != nil {
+		log.Fatal(err.Error())
 	}
+
+	if err := db.Ping(); err != nil {
+		log.Fatal(err.Error())
+	}
+
+	go RateLimitWorker(requests, db)
+
 	return requests
 }
 
 func RateLimitWorker(requests chan *Request, db *DB) {
 	for request := range requests {
-		// remote := request.HTTPRequest.RemoteAddr
-		// remote = strings.Split(remote, ":")[0]
-		// forwarded := request.HTTPRequest.Header.Get("X-Forwarded-For")
-		// real := request.HTTPRequest.Header.Get("X-Real-IP")
-		// log.Printf("remote (%s), forwarded (%s), real (%s)", remote, forwarded, real)
-		// ip := forwarded
-
 		ip := request.HTTPRequest.Header.Get("X-Forwarded-For")
-
 		email := request.HTTPRequest.Header.Get("X-Forwarded-Email")
-		ts := time.Now().Unix()
+		date := strings.Split(time.Now().String(), " ")[0]
 
 		tx, err := db.Begin()
 		if err != nil {
@@ -201,11 +220,11 @@ func RateLimitWorker(requests chan *Request, db *DB) {
 
 		// TODO Implement when blocking is needed
 		// var count int
-		// record, err := tx.GetRecord(email, ip, ts)
-		_, err = tx.GetRecord(email, ip, ts)
+		// record, err := tx.GetRecord(email, ip, date)
+		_, err = tx.GetRecord(email, ip, date)
 		if err != nil {
 			if err == sql.ErrNoRows {
-				if err := tx.NewRecord(email, ip, ts); err != nil {
+				if err := tx.NewRecord(email, ip, date); err != nil {
 					log.Print(err.Error())
 					// Pass through if error
 					tx.Rollback()
@@ -227,7 +246,7 @@ func RateLimitWorker(requests chan *Request, db *DB) {
 		// Debugging
 		// log.Printf("ip: %s, email: %s, count: %d", ip, email, count)
 
-		if err := tx.IncRecord(email, ip, ts); err != nil {
+		if err := tx.IncRecord(email, ip, date); err != nil {
 			log.Print(err.Error())
 			tx.Rollback()
 			// request.Result <- true
@@ -273,6 +292,10 @@ func main() {
 	if err != nil {
 		flag.Usage()
 		log.Fatalf("invalid --upstream (%s) %s", upstream, err.Error())
+	}
+
+	if err := LayoutDB(dataSource); err != nil {
+		log.Fatal(err)
 	}
 
 	recovery := negroni.NewRecovery()
